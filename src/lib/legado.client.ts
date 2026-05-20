@@ -174,6 +174,9 @@ function renderTemplateExpressions(raw: string, keyword = '', page = 1) {
     if (/^(key|keyword|searchTerms)$/.test(value)) return encodeRuleParam(keyword || '');
     if (/^(page|pageIndex)$/.test(value)) return String(page);
     const evaluated = safeEvalTemplateExpression(value, keyword, page);
+    // 表达式里如果已经显式调用 encodeURIComponent/encodeURI/java.encodeURI，
+    // 结果就是编码后的参数，不能再 encode 一次，否则会把 % 编成 %25。
+    if (/\b(?:encodeURIComponent|encodeURI|java\.encodeURI|java\.encodeURIComponent)\s*\(/.test(value)) return evaluated;
     return encodeRuleParam(evaluated);
   });
 }
@@ -211,6 +214,7 @@ function makeSourceRuntime(source: any, baseUrl?: string) {
 
 function runJsSnippetRaw(code: string, context: Record<string, any>, timeout = 1000): any {
   const sourceRuntime = makeSourceRuntime(context.source, context.baseUrl);
+  let lastPut: any = null;
   const java = {
     base64Encode: (value: unknown) => Buffer.from(String(value ?? ''), 'utf8').toString('base64'),
     base64Decode: (value: unknown) => Buffer.from(String(value ?? ''), 'base64').toString('utf8'),
@@ -223,9 +227,11 @@ function runJsSnippetRaw(code: string, context: Record<string, any>, timeout = 1
     deviceID: () => '',
     androidId: () => '',
     longToast: () => undefined,
+    toast: () => undefined,
+    startBrowserAwait: () => ({ body: () => '' }),
     encodeURI: (value: unknown) => encodeURIComponent(String(value ?? '')),
     encodeURIComponent: (value: unknown) => encodeURIComponent(String(value ?? '')),
-    put: (key: string, value: any) => { variableStore.set(key, value); return value; },
+    put: (key: string, value: any) => { lastPut = { key, value }; variableStore.set(key, value); return value; },
     get: (key: string) => variableStore.get(key),
     log: () => undefined,
     htmlFormat: (value: unknown) => he.decode(String(value ?? '')).replace(/<br\s*\/?/gi, '\n').replace(/<[^>]+>/g, ''),
@@ -260,14 +266,17 @@ function runJsSnippetRaw(code: string, context: Record<string, any>, timeout = 1
     const result = script.runInNewContext(sandbox, { timeout });
     if (result !== undefined && result !== null && result !== '') return result;
     if (sandbox.result !== context.result && sandbox.result !== undefined && sandbox.result !== null && sandbox.result !== '') return sandbox.result;
+    if (lastPut?.key === 'url') return lastPut.value;
   } catch {
     // 如果 @js 后面是单个表达式（例如 header: @js:JSON.stringify({...})），上面的函数体不会自动返回。
   }
   try {
     const script = new vm.Script(`(function(){ ${body}
-; if (typeof result !== 'undefined') return result; if (typeof res !== 'undefined') return res; return ''; })()`);
+; if (typeof res !== 'undefined') return res; return ''; })()`);
     const result = script.runInNewContext(sandbox, { timeout });
     if (result !== undefined && result !== null && result !== '') return result;
+    if (sandbox.result !== context.result && sandbox.result !== undefined && sandbox.result !== null && sandbox.result !== '') return sandbox.result;
+    if (lastPut?.key === 'url') return lastPut.value;
   } catch {
     // fallback to expression mode below
   }
@@ -276,6 +285,7 @@ function runJsSnippetRaw(code: string, context: Record<string, any>, timeout = 1
     const result = script.runInNewContext(sandbox, { timeout });
     if (result !== undefined && result !== null && result !== '') return result;
     if (sandbox.result !== context.result && sandbox.result !== undefined && sandbox.result !== null && sandbox.result !== '') return sandbox.result;
+    if (lastPut?.key === 'url') return lastPut.value;
     return '';
   } catch {
     return '';
@@ -593,7 +603,7 @@ function parseStep(step: string): { selector: string; attr: string } {
 }
 
 function stripFilters(rule: string) {
-  return splitRuleFilters(rule).base;
+  return splitRuleFilters(stripRuleJsBlocks(rule)).base;
 }
 
 function applyLegadoIndexSelector(current: cheerio.Cheerio<any>, selector: string): { current: cheerio.Cheerio<any>; selector: string } {
@@ -606,7 +616,7 @@ function applyLegadoIndexSelector(current: cheerio.Cheerio<any>, selector: strin
     const real = idx < 0 ? current.length + idx : idx;
     return { current: current.filter((index) => index !== real), selector: '' };
   }
-  const range = normalized.match(/(?:\[(-?\d*):(-?\d*)(?::(-?\d+))?\]|\.(-?\d*):(-?\d*))$/);
+  const range = normalized.match(/(?:\[(-?\d*):(-?\d*)(?::(-?\d+))?\]|\.(-?\d*):(-?\d*)(?::(-?\d+))?)$/);
   if (range) {
     normalized = normalized.slice(0, range.index).trim();
     current = normalized ? current.find(normalized) : current;
@@ -617,7 +627,9 @@ function applyLegadoIndexSelector(current: cheerio.Cheerio<any>, selector: strin
     const end = endRaw ? Number(endRaw) : length;
     const realStart = start < 0 ? length + start : start;
     const realEnd = end < 0 ? length + end : end;
-    return { current: current.slice(realStart, realEnd), selector: '' };
+    const step = Number(range[3] ?? range[6] ?? 1) || 1;
+    const sliced = current.slice(realStart, realEnd);
+    return { current: step === 1 ? sliced : sliced.filter((_, index) => index % Math.abs(step) === 0), selector: '' };
   }
   const indexMatch = normalized.match(/(?:\[(-?\d+)\]|\.(-?\d+))$/);
   if (indexMatch) {
@@ -644,7 +656,7 @@ function applyLegadoSelector($: cheerio.CheerioAPI, current: cheerio.Cheerio<any
   if (
     tokens.length > 1
     && tokens.every((token) => !/[>+~]/.test(token))
-    && tokens.some((token) => /(?:\[!?\-?\d+\]|\[-?\d*:|-?\d+\]$|\.-?\d+(?::\-?\d*)?)$/.test(token))
+    && tokens.some((token) => /(?:\[!?\-?\d+\]|\[-?\d*:|-?\d+\]$|\.-?\d+(?::\-?\d*){0,2})$/.test(token))
   ) {
     let next = current;
     for (const token of tokens) {
@@ -728,6 +740,22 @@ function selectXPath($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule: st
 
 function readValue($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: string, baseUrl?: string, jsContext?: Record<string, any>): string {
   for (const alternative of splitAlternatives(rule)) {
+    if (alternative.includes('{{baseUrl}}')) {
+      const { base, filters } = splitRuleFilters(alternative);
+      const value = applyRuleFilters(base.replace(/\{\{baseUrl\}\}/g, baseUrl || ''), filters);
+      if (value) return value;
+      continue;
+    }
+    if (/^<js>/i.test(alternative.trim())) {
+      const transformed = runJsSnippet(alternative, { ...(jsContext || {}), result: root.text(), src: root.text(), baseUrl });
+      if (transformed) return /^(?:https?:)?\/\//i.test(transformed) || transformed.startsWith('/') ? normalizeUrl(baseUrl || '', transformed) : transformed;
+      continue;
+    }
+    if (/^@js:/i.test(alternative.trim())) {
+      const transformed = runJsSnippet(alternative, { ...(jsContext || {}), result: root.text(), src: root.text(), baseUrl });
+      if (transformed) return /^(?:https?:)?\/\//i.test(transformed) || transformed.startsWith('/') ? normalizeUrl(baseUrl || '', transformed) : transformed;
+      continue;
+    }
     const jsIndex = alternative.indexOf('@js:');
     if (jsIndex > 0) {
       const selectorRule = alternative.slice(0, jsIndex).trim();
@@ -1173,7 +1201,7 @@ function parseExploreUrl(exploreUrl?: string): Array<{ title: string; template: 
       .filter((item) => !!item.title);
   }
   return raw
-    .split('&&')
+    .split(/&&|\r?\n+/)
     .map((item) => item.trim())
     .filter(Boolean)
     .map((item) => {
@@ -1582,7 +1610,12 @@ export class LegadoClient {
         const normalizedNext = normalizeUrl(targetUrl, nextTocUrl);
         if (!normalizedNext || visited.has(normalizedNext)) break;
         visited.add(normalizedNext);
-        const nextHtml = await fetchText(source, normalizedNext);
+        let nextHtml = '';
+        try {
+          nextHtml = await fetchText(source, normalizedNext);
+        } catch {
+          break;
+        }
         const $next = cheerio.load(nextHtml);
         const nextItems = selectElements($next, $next.root(), rule.ruleToc.chapterList);
         nextItems.each((index, element) => {
